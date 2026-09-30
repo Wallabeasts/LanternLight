@@ -253,6 +253,16 @@ details.spend{margin:.4rem 0 .6rem}
 details.spend summary{cursor:pointer;color:var(--mist);font-size:.9rem}
 table.usage{border-collapse:collapse;font-size:.82rem;margin-top:.4rem;width:100%}
 table.usage th,table.usage td{border-bottom:1px solid var(--line);padding:.25rem .4rem;text-align:left;white-space:nowrap}
+/* easier scrolling */
+.center{position:relative}
+.jump{position:absolute;right:1rem;bottom:calc(var(--abh, 150px) + .6rem);z-index:5;background:var(--brass);color:var(--ink);border:0;border-radius:999px;padding:.45em .9em;font-weight:700;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.45)}
+.sheetnav{position:sticky;top:-1rem;z-index:3;display:flex;gap:.3rem;overflow-x:auto;background:var(--slate);padding:.5rem 0;margin:-.5rem 0 .6rem;scrollbar-width:none}
+.sheetnav .chip{flex:none;font-size:.82rem}
+details.sec>summary{list-style:none;cursor:pointer}
+details.sec>summary::-webkit-details-marker{display:none}
+details.sec>summary h3::after{content:" ▾";color:var(--mist);font-size:.8em}
+details.sec:not([open])>summary h3::after{content:" ▸"}
+.sync-ok{color:var(--good)} .sync-bad{color:var(--bad)}
 /* memory */
 .lore{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer;border-bottom:1px dotted var(--wax);line-height:inherit}
 .lore:hover{color:var(--wax)}
@@ -439,30 +449,34 @@ let settings = Object.assign({}, DEFAULT_SETTINGS, LS.get("ll.settings", {}));
 ["anthropicKey", "openaiKey", "pollinationsKey"].forEach(k => settings[k] = cleanKey(settings[k]));
 settings.keys = Object.assign({}, settings.keys); settings.models = Object.assign({}, settings.models); settings.helperModels = Object.assign({}, settings.helperModels);
 if (!settings.v2) { Object.assign(settings, { imageProvider: "auto", autoScene: true, sfx: true, v2: true }); }
-const saveSettings = () => LS.set("ll.settings", settings);
+const saveSettings = () => { LS.set("ll.settings", settings); LS.set("ll.prefsUpdated", Date.now()); if (typeof scheduleSync === "function") scheduleSync(3000); };
 
 function listSaves() { return LS.get("ll.saves", []); }
 // Campaigns live in IndexedDB (room for very long campaigns); a small index lives in localStorage.
-function saveGame(g) {
-  g.updated = Date.now();
+function saveGame(g, opts = {}) {
+  if (!opts.keepTime) g.updated = Date.now();
   const meta = { id: g.id, title: g.title, name: g.pc.name, cls: g.pc.cls, level: g.pc.level, species: g.pc.species, portraitId: g.pc.portraitId, updated: g.updated, location: g.location || "" };
   const saves = listSaves().filter(s => s.id !== g.id); saves.unshift(meta);
   LS.set("ll.saves", saves);
   let snapshot; try { snapshot = JSON.parse(JSON.stringify(g)); } catch (e) { toast("Couldn't save: " + e.message); return; }
   IDB.put(g.id, snapshot, "games").catch(e => toast("Couldn't save your campaign: " + (e?.message || "storage error"), 6000));
   if (typeof updateLegend === "function") updateLegend(g);
+  if (!opts.noSync && typeof scheduleSync === "function") scheduleSync();
 }
 async function loadGame(id) {
   let g = await IDB.get(id, "games").catch(() => null);
   if (!g) { g = LS.get("ll.game." + id, null); if (g) { await IDB.put(id, g, "games").catch(() => {}); } }
   return g;
 }
-async function deleteGame(id) {
+// tombTime is set when the deletion came from another device.
+async function deleteGame(id, tombTime) {
+  const D = LS.get("ll.deleted", {}); D[id] = tombTime || Date.now(); LS.set("ll.deleted", D);
   const g = await loadGame(id);
   if (g) for (const k of allImageIds(g)) IDB.del(k);
   await IDB.del(id, "games"); localStorage.removeItem("ll.game." + id);
   LS.set("ll.saves", listSaves().filter(s => s.id !== id));
   const L = LS.get("ll.legends", {}); delete L[id]; LS.set("ll.legends", L);
+  if (!tombTime && typeof scheduleSync === "function") scheduleSync(1000);
 }
 // One-time move of older saves out of localStorage
 async function migrateSaves() {
@@ -935,16 +949,17 @@ async function takeTurn(playerText) {
   }
   undoSnap = clone(game);
   busy = true; renderActionBar();
+  let scrolledToReply = false;
   const entry = { id: uid(), role: "dm", text: "", raw: "" };
   game.log.push(entry);
-  renderLog(true);
+  renderLog("bottom");
   try {
     const raw = await aiStream({ cached: dmRules(game), cached2: dmDossier(game) }, dmMessages(game), txt => {
       let vis = splitState(txt).text;
       const lt = vis.lastIndexOf("<"); if (lt >= 0 && "<state".startsWith(vis.slice(lt).trim())) vis = vis.slice(0, lt).trimEnd();
       entry.text = vis;
       const el = $(`[data-eid="${entry.id}"]`);
-      if (el) { el.innerHTML = mdLite(vis); el.classList.add("cursor"); scrollDown(); }
+      if (el) { el.innerHTML = mdLite(vis); el.classList.add("cursor"); if (!scrolledToReply && vis) { scrolledToReply = true; scrollToReply(); } }
     }, replyLength().max, { cacheHistory: true });
     let { text, state } = splitState(raw);
     if (!state && text) {
@@ -1015,8 +1030,9 @@ function applyState(s) {
   }
   (s.conditions_add || []).forEach(c => c && !p.conditions.includes(c) && p.conditions.push(c));
   (s.conditions_remove || []).forEach(c => { p.conditions = p.conditions.filter(x => x.toLowerCase() !== String(c).toLowerCase()); });
-  g._combatStarted = false;
+  g._combatStarted = false; g._combatEnded = false;
   if ("combat" in s) {
+    if (!s.combat && g.combat) g._combatEnded = true;
     if (s.combat && !g.combat) g._combatStarted = true;
     if (s.combat && g.combat && g.map) (s.combat.enemies || []).forEach(e => { const o = (g.combat.enemies || []).find(o => o.name === e.name); if (o && e.hp !== o.hp) floatOnToken(e.name, (e.hp > o.hp ? "+" : "") + (e.hp - o.hp), e.hp > o.hp ? "#8fe07a" : "#ff6a5f"); });
     g.combat = s.combat || null;
@@ -1070,6 +1086,8 @@ async function afterTurnExtras(s) {
   if (game._newLocation) showTitleCard(game._newLocation, game.quest || "");
   if (hpFloat) floatSheetHP(hpFloat);
   if (game._combatStarted && settings.autoMap) { sfx("combat"); buildBattleMap(true); }
+  else if (game._combatStarted && game.map) { mapState.open = true; renderMapPanel(); }
+  if (game._combatEnded && window.innerWidth <= 1000) { mapState.open = false; renderMapPanel(); }
   if (game._newScene && settings.autoScene && haveImageAI()) illustrateScene(true);
 }
 
@@ -1296,6 +1314,15 @@ function openSettings() {
   openModal(`
   <div class="row"><h2 style="margin:0">Settings</h2><span class="spacer"></span><span class="small muted">Lanternlight v1.0</span></div>
   <p class="muted small">Keys are stored only in this browser on this device and sent straight to the service you pick. Free tiers cost nothing but have daily limits; paid services bill your account.</p>
+  <div class="panel" style="padding:.8rem 1rem">
+    <h3 style="margin:0 0 .3rem">Your account (sync across devices)</h3>
+    ${syncOn() ? `<p class="small syncstatus ${syncBad ? "sync-bad" : "sync-ok"}" style="margin:.2rem 0 .5rem">${esc(syncStatusText())}</p>
+      <div class="row"><button class="btn sm" id="sy_now">Sync now</button><button class="btn sm ghost" id="sy_out">Sign out on this device</button></div>`
+    : `<p class="small muted" style="margin:.2rem 0 .5rem">Sign in with your GitHub account to keep campaigns, the Codex, portraits and settings the same on your phone and computer. API keys stay on each device.</p>
+      <ol class="small muted" style="margin:.2rem 0 .5rem;padding-left:1.2rem"><li><a class="keylink" href="${TOKEN_URL}" target="_blank" rel="noopener">Create a GitHub sign-in token</a>: the "gist" box is already checked. Set Expiration to "No expiration", then click Generate token.</li><li>Copy the token (it starts with ghp_) and paste it here. Use the same token on your other devices.</li></ol>
+      <div class="row"><input type="password" id="sy_tok" placeholder="ghp_…" style="flex:1" autocomplete="off"><button class="btn sm primary" id="sy_in">Sign in</button></div>
+      <p class="small syncstatus" style="margin:.4rem 0 0"></p>`}
+  </div>
   <label class="f"><span>Dungeon Master AI</span>
     <select id="s_provider">
       <optgroup label="Free (no card needed)"><option value="gemini">${PROVIDERS.gemini.name}</option><option value="groq">${PROVIDERS.groq.name}</option><option value="openrouter">${PROVIDERS.openrouter.name}</option></optgroup>
@@ -1343,6 +1370,10 @@ function openSettings() {
   </div>`);
   $("#s_provider").value = settings.provider; $("#s_iq").value = settings.imageQuality; $("#s_ip").value = settings.imageProvider;
   $("#s_provider").onchange = e => $$(".pblock").forEach(b => b.classList.toggle("hidden", b.dataset.p !== e.target.value));
+  if ($("#sy_in")) $("#sy_in").onclick = async () => { const b = $("#sy_in"); b.disabled = true; setSyncStatus("Signing in…");
+    try { await connectSync($("#sy_tok").value); openSettings(); } catch (e) { setSyncStatus("Sign-in didn't work: " + e.message, true); b.disabled = false; } };
+  if ($("#sy_now")) $("#sy_now").onclick = () => syncNow();
+  if ($("#sy_out")) $("#sy_out").onclick = () => { if (confirm("Sign out of sync on this device? Your campaigns stay here and on GitHub.")) { signOutSync(); openSettings(); } };
   $("#s_resetUsage").onclick = () => { if (confirm("Reset the spending counter?")) { localStorage.removeItem("ll.usage"); openSettings(); } };
   $$("[data-findmodels]").forEach(btn => btn.onclick = async ev => {
     ev.preventDefault(); collect(); const p = btn.dataset.findmodels, o = $("#s_testout");
@@ -1395,6 +1426,7 @@ function renderHome() {
       <h1>Your table is set.</h1>
       <p>Build a hero, gather a party, and play a full D&amp;D campaign with an AI Dungeon Master — with dice, character sheets, portraits and maps.</p>
       ${haveTextAI() ? "" : `<p class="panel small">To play, pick a Dungeon Master AI in Settings. Google Gemini and Groq have free tiers that need no card, just a free key. <button class="btn sm primary" data-act="settings">Open settings</button></p>`}
+      ${syncOn() ? `<p class="small syncstatus ${syncBad ? "sync-bad" : "sync-ok"}">${esc(syncStatusText())}</p>` : `<p class="small muted">Play on more than one device? <button class="keylink" style="background:none;border:0;padding:0;cursor:pointer" data-act="settings">Sign in to sync</button></p>`}
       <div class="row" style="margin-top:1.2rem">
         <button class="btn primary" data-act="new">Start a new campaign</button>
         <label class="btn ghost" style="cursor:pointer">Import a save<input type="file" id="importFile" accept=".json,application/json" class="hidden"></label>
@@ -1789,7 +1821,8 @@ function stopMap() { cancelAnimationFrame(mapState.raf); mapState.ro && mapState
 function sizeMap() {
   const c = mapState.canvas, m = game?.map; if (!c || !m) return;
   const box = c.parentElement.getBoundingClientRect();
-  const maxH = mapState.full ? box.height - 8 : Math.max(220, Math.min(window.innerHeight * 0.42, 460));
+  const narrow = window.innerWidth <= 1000;
+  const maxH = mapState.full ? box.height - 8 : narrow ? Math.max(170, window.innerHeight * 0.3) : Math.max(220, Math.min(window.innerHeight * 0.42, 460));
   const tile = Math.max(14, Math.floor(Math.min((box.width - 4) / m.w, maxH / m.h)));
   const dpr = window.devicePixelRatio || 1;
   c.style.width = tile * m.w + "px"; c.style.height = tile * m.h + "px";
@@ -2041,7 +2074,7 @@ function showTip(t) {
 /* ============ memory: codex, quests, chapters, table memory, legends ============ */
 const CODEX_TYPES = { npc: "People", place: "Places", faction: "Factions", item: "Items", lore: "Lore & secrets", event: "Events" };
 const tableMem = () => Object.assign({ notes: [], legends: true }, LS.get("ll.table", {}));
-const saveTableMem = t => LS.set("ll.table", t);
+const saveTableMem = t => { LS.set("ll.table", t); LS.set("ll.tableUpdated", Date.now()); if (typeof scheduleSync === "function") scheduleSync(3000); };
 function ensureMemory(g) { g.codex = g.codex || []; g.chapters = g.chapters || []; g.quests = g.quests || []; g.turn = g.turn || 0; }
 const normName = s => String(s || "").toLowerCase().replace(/^(the|a|an)\s+/, "").replace(/[^a-z0-9 ]/g, "").trim();
 function findEntry(g, name) {
@@ -2474,6 +2507,157 @@ function usageTable() {
     <p class="small muted">Numbers are tokens (about ¾ of a word each). This is an estimate; your Anthropic Console shows the exact bill.</p>`;
 }
 
+/* ============ sync across devices (stored in a private GitHub Gist) ============ */
+// Your GitHub account is the "account": campaigns, Codex, portraits and preferences are saved to a secret gist.
+// API keys are never synced — paste them once on each device.
+const SYNC_DESC = "Lanternlight sync (do not edit)";
+const TOKEN_URL = "https://github.com/settings/tokens/new?scopes=gist&description=Lanternlight%20sync";
+const syncCfg = () => LS.get("ll.sync", null);
+const syncOn = () => !!syncCfg()?.gistId;
+let syncing = false, syncAgain = false, syncTimer = null, syncMsg = "", syncBad = false;
+
+async function gh(path, opt = {}) {
+  const c = syncCfg();
+  const res = await fetchRetry("https://api.github.com" + path, { ...opt, headers: { "Accept": "application/vnd.github+json", "Authorization": "Bearer " + c.token, ...(opt.body ? { "Content-Type": "application/json" } : {}) } }, 2)
+    .catch(e => { if (/401|Bad credentials/i.test(e.message)) throw new Error("GitHub didn't accept the token. Make a new one (with the gist box checked) and sign in again."); throw e; });
+  return res.status === 204 ? null : res.json();
+}
+function setSyncStatus(msg, bad) {
+  syncMsg = msg; syncBad = !!bad;
+  $$(".syncstatus").forEach(el => { el.textContent = msg; el.classList.toggle("sync-bad", !!bad); el.classList.toggle("sync-ok", !bad); });
+}
+function syncStatusText() {
+  const c = syncCfg(); if (!c?.gistId) return "";
+  if (syncMsg) return syncMsg;
+  return c.last ? `Synced with GitHub (${c.login}) ${timeAgo(c.last)}.` : `Signed in to GitHub as ${c.login}.`;
+}
+function timeAgo(t) { const s = (Date.now() - t) / 1000; return s < 60 ? "just now" : s < 3600 ? Math.round(s / 60) + " min ago" : s < 86400 ? Math.round(s / 3600) + " h ago" : new Date(t).toLocaleDateString(); }
+function scheduleSync(ms = 15000) { if (!syncOn()) return; clearTimeout(syncTimer); syncTimer = setTimeout(() => syncNow(), ms); }
+
+async function connectSync(token) {
+  token = cleanKey(token);
+  if (!token) throw new Error("Paste your GitHub token first.");
+  LS.set("ll.sync", { token });
+  try {
+    const me = await gh("/user");
+    let gist = null;
+    for (let page = 1; page <= 5 && !gist; page++) {
+      const list = await gh(`/gists?per_page=100&page=${page}`);
+      gist = list.find(x => x.description === SYNC_DESC);
+      if (list.length < 100) break;
+    }
+    if (!gist) gist = await gh("/gists", { method: "POST", body: JSON.stringify({ description: SYNC_DESC, public: false, files: { "index.json": { content: JSON.stringify({ v: 1, campaigns: {}, deleted: {} }) } } }) });
+    LS.set("ll.sync", { token, gistId: gist.id, login: me.login, last: 0 });
+  } catch (e) { localStorage.removeItem("ll.sync"); throw e; }
+  await syncNow();
+}
+function signOutSync() { localStorage.removeItem("ll.sync"); syncMsg = ""; }
+
+// Portraits first, then the newest pictures, up to about 3 MB per campaign.
+async function collectImages(g) {
+  const first = [g.pc.portraitId, ...g.party.map(c => c.portraitId), ...(g.codex || []).map(e => e.portraitId)].filter(Boolean);
+  const rest = allImageIds(g).filter(id => !first.includes(id)).reverse();
+  const out = {}; let size = 0;
+  for (const id of [...new Set([...first, ...rest])]) {
+    const v = await IDB.get(id); if (!v) continue;
+    if (size + v.length > 3e6 && !first.includes(id)) continue;
+    out[id] = v; size += v.length;
+  }
+  return out;
+}
+function hashKeys(obj) { const k = Object.keys(obj).sort().join(","); let h = 0; for (let i = 0; i < k.length; i++) h = (h * 31 + k.charCodeAt(i)) | 0; return k.length + ":" + h; }
+const SYNCED_PREFS = ["provider", "anthropicModel", "openaiModel", "models", "helperModels", "customBase", "replyLength", "images", "imageProvider", "imageModel", "imageQuality", "autoMap", "autoScene", "sfx", "tts"];
+
+async function syncNow() {
+  if (!syncOn()) return;
+  if (syncing) { syncAgain = true; return; }
+  syncing = true; setSyncStatus("Syncing…");
+  let pulled = 0, pushed = 0;
+  try {
+    const c = syncCfg();
+    const gist = await gh(`/gists/${c.gistId}`);
+    const files = gist.files || {};
+    const readFile = async name => {
+      const f = files[name]; if (!f) return null;
+      if (f.truncated || f.content == null) { const r = await fetch(f.raw_url); if (!r.ok) throw new Error("Couldn't download " + name); return r.text(); }
+      return f.content;
+    };
+    const remote = JSON.parse((await readFile("index.json")) || "{}");
+    remote.campaigns = remote.campaigns || {}; remote.deleted = remote.deleted || {};
+    const push = {}; let indexChanged = false;
+
+    // 1. deletions, both directions
+    const localDel = LS.get("ll.deleted", {});
+    for (const [id, t] of Object.entries(localDel)) {
+      if (!remote.deleted[id] || remote.deleted[id] < t) {
+        remote.deleted[id] = t; delete remote.campaigns[id]; indexChanged = true;
+        ["c_", "i_"].forEach(p => { if (files[p + id + ".json"]) push[p + id + ".json"] = null; });
+      }
+    }
+    for (const [id, t] of Object.entries(remote.deleted)) {
+      const loc = listSaves().find(s => s.id === id);
+      if (loc && loc.updated <= t) { if (game?.id === id) { game = null; view = "home"; } await deleteGame(id, t); pulled++; }
+    }
+    // 2. pull campaigns that are newer on GitHub
+    for (const [id, meta] of Object.entries(remote.campaigns)) {
+      const loc = listSaves().find(s => s.id === id);
+      if (loc && meta.updated <= loc.updated) continue;
+      if (game?.id === id && busy) continue;              // don't swap a campaign mid-reply
+      const txt = await readFile(`c_${id}.json`); if (!txt) continue;
+      const g = JSON.parse(txt);
+      const itxt = await readFile(`i_${id}.json`);
+      if (itxt) for (const [k, v] of Object.entries(JSON.parse(itxt))) if (!(await IDB.get(k))) { await IDB.put(k, v); }
+      saveGame(g, { keepTime: true, noSync: true }); pulled++;
+      if (game?.id === id) { game = g; if (view === "play") { renderPlayAll(); toast("Picked up where you left off on your other device."); } }
+    }
+    // 3. push campaigns that are newer here
+    for (const loc of listSaves()) {
+      const r = remote.campaigns[loc.id];
+      if (r && r.updated >= loc.updated) continue;
+      const g = (game?.id === loc.id) ? game : await loadGame(loc.id); if (!g) continue;
+      const imgs = await collectImages(g), h = hashKeys(imgs);
+      push[`c_${loc.id}.json`] = { content: JSON.stringify(g) };
+      if (!r || r.imgHash !== h || !files[`i_${loc.id}.json`]) push[`i_${loc.id}.json`] = { content: JSON.stringify(imgs) };
+      remote.campaigns[loc.id] = { ...loc, updated: g.updated, imgHash: h }; indexChanged = true; pushed++;
+    }
+    // 4. "About you" notes and legends: merge both ways
+    const t = tableMem(), rt = remote.table || { notes: [], legends: true };
+    const notes = [...(rt.notes || []), ...t.notes].filter((n, i, a) => a.findIndex(x => normName(x.t) === normName(n.t)) === i).slice(-30);
+    const forgotten = new Set([...(rt.forgotten || []), ...(t.forgotten || [])]);
+    const merged = { notes: notes.filter(n => !forgotten.has(n.id)), legends: (LS.get("ll.tableUpdated", 0) >= (remote.tableUpdated || 0)) ? t.legends : rt.legends, forgotten: [...forgotten].slice(-100) };
+    if (JSON.stringify(merged.notes) !== JSON.stringify(t.notes) || merged.legends !== t.legends) LS.set("ll.table", merged);
+    if (JSON.stringify(merged) !== JSON.stringify(rt)) { remote.table = merged; remote.tableUpdated = Date.now(); indexChanged = true; }
+    const L = LS.get("ll.legends", {}), RL = remote.legends || {};
+    for (const [id, v] of Object.entries(RL)) if (!remote.deleted[id] && (!L[id] || L[id].updated < v.updated)) L[id] = v;
+    for (const id of Object.keys(L)) if (remote.deleted[id]) delete L[id];
+    LS.set("ll.legends", L);
+    if (JSON.stringify(L) !== JSON.stringify(RL)) { remote.legends = L; indexChanged = true; }
+    // 5. preferences (never keys)
+    const prefsLocalT = LS.get("ll.prefsUpdated", 0);
+    if (remote.prefs && (remote.prefsUpdated || 0) > prefsLocalT) {
+      SYNCED_PREFS.forEach(k => { if (k in remote.prefs) settings[k] = remote.prefs[k]; });
+      LS.set("ll.settings", settings); LS.set("ll.prefsUpdated", remote.prefsUpdated);
+    } else if (prefsLocalT > (remote.prefsUpdated || 0)) {
+      remote.prefs = Object.fromEntries(SYNCED_PREFS.map(k => [k, settings[k]])); remote.prefsUpdated = prefsLocalT; indexChanged = true;
+    }
+
+    if (indexChanged || Object.keys(push).length) {
+      push["index.json"] = { content: JSON.stringify(remote) };
+      await gh(`/gists/${c.gistId}`, { method: "PATCH", body: JSON.stringify({ files: push }) });
+    }
+    c.last = Date.now(); LS.set("ll.sync", c);
+    syncMsg = "";
+    setSyncStatus(`Synced with GitHub (${c.login}) just now${pulled ? `, ${pulled} campaign${pulled > 1 ? "s" : ""} updated from another device` : ""}.`);
+    if (pulled && view === "home") renderHome();
+  } catch (e) {
+    setSyncStatus("Sync didn't work: " + e.message, true);
+  } finally {
+    syncing = false;
+    if (syncAgain) { syncAgain = false; scheduleSync(2000); }
+  }
+}
+document.addEventListener("visibilitychange", () => { if (document.hidden && syncOn()) { if (game) saveGame(game, { noSync: true }); syncNow(); } });
+
 /* ============ spectacle: dice, title cards, sound ============ */
 let audioCtx = null;
 function sfx(kind) {
@@ -2686,23 +2870,29 @@ function renderPlay() {
     <section class="center">
       <div id="mapwrap" class="hidden"></div>
       <div class="scroll" id="scroll"><article class="parchment" id="log" aria-live="polite"></article></div>
+      <button id="jumpBtn" class="jump hidden" data-act="jump" aria-label="Jump to the latest">↓ Latest</button>
       <div class="actionbar" id="actionbar"></div>
     </section>
     <aside class="side right" id="rightp" aria-label="Party and tools"></aside>
     <nav class="tabbar">${[["story", "Story"], ["sheet", "Character"], ["party", "Party & dice"]].map(([k, n]) => `<button data-act="tab" data-t="${k}" class="${playTab === k ? "on" : ""}">${n}</button>`).join("")}</nav>
   </div>`;
+  logShown = 50;
   renderPlayAll(); scrollDown(true);
+  $("#scroll").addEventListener("scroll", updateJump, { passive: true });
 }
 function renderPlayAll() {
   if (view !== "play" || !game) return;
   setWhere(`<b>${esc(game.location || game.title)}</b>${game.quest ? "&ensp;<span>Objective: " + esc(game.quest) + "</span>" : ""}`);
   renderMapPanel(); renderLog(); renderSheet(); renderRight(); renderActionBar();
 }
-function renderLog(streamingNew) {
+// Only the most recent part of the story is drawn; "Show earlier" reveals more. Keeps long campaigns fast to scroll.
+let logShown = 50;
+function renderLog(mode) {
   const L = $("#log"); if (!L) return;
+  const S = $("#scroll"), before = S ? S.scrollHeight - S.scrollTop : 0;
   const lastDM = [...game.log].reverse().find(e => e.role === "dm");
-  const MAX_SHOWN = 400, hidden = Math.max(0, game.log.length - MAX_SHOWN);
-  L.innerHTML = (hidden ? `<p class="e system">${hidden} earlier moments are in the Codex chapters.</p>` : "") + game.log.slice(hidden).map(e => {
+  const hidden = Math.max(0, game.log.length - logShown);
+  L.innerHTML = (hidden ? `<div class="e system"><button class="btn sm" data-act="more">Show ${Math.min(50, hidden)} earlier moments</button> <span>(${hidden} hidden; the Codex has the full story)</span></div>` : "") + game.log.slice(hidden).map(e => {
     switch (e.role) {
       case "dm": return `<div class="e dm${busy && e === lastDM && !e.done ? " cursor" : ""}" data-eid="${e.id}">${e.text ? (e.raw || e.done ? linkLore(mdLite(e.text), game) : mdLite(e.text)) : ""}</div>`;
       case "memo": {
@@ -2717,8 +2907,22 @@ function renderLog(streamingNew) {
       default: return `<div class="e system">${esc(e.text)}</div>`;
     }
   }).join("") || `<p class="e system">The story begins in a moment…</p>`;
-  hydrateImages(L).then(() => scrollDown(streamingNew));
-  scrollDown(streamingNew);
+  if (mode === "keep" && S) S.scrollTop = S.scrollHeight - before;   // after "Show earlier": stay where you were
+  else if (mode === "bottom") scrollDown(true);
+  else if (mode === "reply") scrollToReply();
+  else scrollDown(false);
+  hydrateImages(L).then(() => { if (mode === "bottom") scrollDown(true); });
+  updateJump();
+}
+// Put the top of the DM's newest reply near the top of the screen, so you read it from the start.
+function scrollToReply() {
+  const S = $("#scroll"), last = [...$$("#log .e.dm")].pop(); if (!S || !last) return;
+  const top = last.getBoundingClientRect().top - S.getBoundingClientRect().top + S.scrollTop - 90;
+  S.scrollTo({ top: Math.max(0, top), behavior: reducedMotion() ? "auto" : "smooth" });
+}
+function updateJump() {
+  const S = $("#scroll"), J = $("#jumpBtn"); if (!S || !J) return;
+  J.classList.toggle("hidden", S.scrollHeight - S.scrollTop - S.clientHeight < 400);
 }
 function renderActionBar() {
   const A = $("#actionbar"); if (!A || !game) return;
@@ -2739,6 +2943,7 @@ function renderActionBar() {
       ${settings.tts ? `<button class="btn sm ghost" data-act="hush">Stop voice</button>` : ""}
       ${undoSnap && !busy ? `<button class="btn sm ghost" data-act="retry" title="Replace the DM's last reply with a new one">Redo DM's reply</button>` : ""}
     </div></div>`;
+  const C = $(".center"); if (C) C.style.setProperty("--abh", A.offsetHeight + "px");
   const ta = $("#say");
   ta.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendSay(); } });
   ta.addEventListener("input", () => { ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 180) + "px"; });
@@ -2750,6 +2955,7 @@ function sendSay() {
   const ta = $("#say"); const t = ta.value.trim(); if (!t || busy) return;
   ta.value = ""; takeTurn(t);
 }
+const sheetOpen = {};   // remembers which sheet sections you opened or closed
 function renderSheet() {
   const S = $("#sheet"); if (!S || !game) return;
   const p = game.pc; ensureSheet(p);
@@ -2758,8 +2964,11 @@ function renderSheet() {
   const xpPct = next ? clamp(Math.round((p.xp - prev) / (next - prev) * 100), 0, 100) : 100;
   const slots = slotTable(p.cls, p.level);
   const dmgNot = d => (String(d).match(/\d*d\d+(\s*[+-]\s*\d+)?/i) || ["1d4"])[0].replace(/\s/g, "");
+  const narrow = window.innerWidth <= 1000;
+  const openAttr = (k, dflt) => (sheetOpen[k] ?? dflt) ? "open" : "";
   S.innerHTML = `
-  <div class="sheethead">${portraitHTML(p.portraitId, p.name)}
+  <nav class="sheetnav" aria-label="Jump to a section">${[["sec-top", "Stats"], ["sec-attacks", "Attacks"], ["sec-skills", "Skills"], ["sec-inv", "Gear"], ["sec-feat", "Features"], ["sec-chron", "Chronicle"]].map(([id, n]) => `<button class="chip" data-act="sheetgo" data-t="${id}">${n}</button>`).join("")}</nav>
+  <div class="sheethead" id="sec-top">${portraitHTML(p.portraitId, p.name)}
     <div><h2 style="font-size:1.45rem;margin:0">${esc(p.name)}</h2><div class="small muted" data-k="level">Level ${p.level} ${esc(p.species)} ${esc(p.cls)}<br>${esc(p.background)}, ${esc(p.alignment)}</div>
     ${p.titles.length ? `<div class="small" style="color:var(--brass);font-style:italic" data-k="titles">${p.titles.map(esc).join(", ")}</div>` : ""}</div></div>
   <div class="row small" data-k="hp"><span>HP <b>${p.hp}</b> / ${p.maxHp}${p.tempHp ? ` <span class="muted">+${p.tempHp} temp</span>` : ""}</span><span class="spacer"></span>
@@ -2779,24 +2988,25 @@ function renderSheet() {
   ${next && p.xp >= next ? `<button class="btn primary sm" data-act="levelup" style="margin-top:.5rem;width:100%">Level up to ${p.level + 1}</button>` : ""}
   <div class="stats">${ABILITIES.map(a => `<button class="ab" data-k="ab${a}" data-act="rollab" data-a="${a}" title="Roll a ${AB_NAMES[a]} check" style="cursor:pointer;color:inherit"><div class="n">${a}</div><div class="v">${p.scores[a]}</div><div class="m">${sgn(modOf(p.scores[a]))}</div></button>`).join("")}</div>
   <p class="small muted" style="margin:.2rem 0">Tap a score, save, skill or attack to roll it.</p>
-  <div class="sec" data-k="attacks"><h3>Attacks</h3>${p.attacks.length ? p.attacks.map((a, i) => `<div class="atk"><span class="nm">${esc(a.name)} <span class="muted small">${esc(a.dmg)}</span></span>
+  <div class="sec" data-k="attacks" id="sec-attacks"><h3>Attacks</h3>${p.attacks.length ? p.attacks.map((a, i) => `<div class="atk"><span class="nm">${esc(a.name)} <span class="muted small">${esc(a.dmg)}</span></span>
       <button class="btn sm" data-act="atk" data-i="${i}">${esc(a.hit)} hit</button><button class="btn sm ghost" data-act="dmg" data-i="${i}">${esc(dmgNot(a.dmg))}</button></div>`).join("") : `<span class="small muted">Being written up…</span> <button class="btn sm ghost" data-act="refreshSheet">Write attacks</button>`}</div>
   ${slots.some(n => n) ? `<div class="sec" data-k="slots"><h3>Spell slots</h3>${slots.map((n, i) => n ? `<div class="row small" style="margin:.2rem 0"><span style="width:4.5em">Level ${i + 1}</span><span class="pips">${Array.from({ length: n }, (_, k) => `<button class="pip ${k < (p.slotsUsed[i + 1] || 0) ? "used" : ""}" data-act="pip" data-l="${i + 1}" data-k2="${k}" aria-label="Level ${i + 1} slot ${k + 1}${k < (p.slotsUsed[i + 1] || 0) ? ", used" : ""}"></button>`).join("")}</span></div>` : "").join("")}</div>` : ""}
-  <div class="sec"><h3>Saving throws</h3>${ABILITIES.map(a => `<div class="skillrow" data-act="rollsave" data-a="${a}" role="button" tabindex="0"><span>${p.saves.includes(a) ? '<span class="p">●</span> ' : "○ "}${AB_NAMES[a]}</span><span>${sgn(pcSaveBonus(p, a))}</span></div>`).join("")}</div>
-  <div class="sec" data-k="skills"><h3>Skills</h3>${ALL_SKILLS.map(s => `<div class="skillrow" data-act="rollskill" data-s="${esc(s)}" role="button" tabindex="0"><span>${p.skills.includes(s) ? '<span class="p">●</span> ' : "○ "}${esc(s)} <span class="muted small">${SKILLS[s]}</span></span><span>${sgn(pcSkillBonus(p, s))}</span></div>`).join("")}
-    <div class="kv" style="margin-top:.3rem"><span>Passive Perception</span><b>${10 + pcSkillBonus(p, "Perception")}</b></div></div>
+  <details class="sec" data-sec="saves" ${openAttr("saves", !narrow)}><summary><h3>Saving throws</h3></summary>${ABILITIES.map(a => `<div class="skillrow" data-act="rollsave" data-a="${a}" role="button" tabindex="0"><span>${p.saves.includes(a) ? '<span class="p">●</span> ' : "○ "}${AB_NAMES[a]}</span><span>${sgn(pcSaveBonus(p, a))}</span></div>`).join("")}</details>
+  <details class="sec" data-k="skills" data-sec="skills" id="sec-skills" ${openAttr("skills", !narrow)}><summary><h3>Skills <span class="small muted">— proficient: ${p.skills.map(esc).join(", ") || "none"}</span></h3></summary>${ALL_SKILLS.map(s => `<div class="skillrow" data-act="rollskill" data-s="${esc(s)}" role="button" tabindex="0"><span>${p.skills.includes(s) ? '<span class="p">●</span> ' : "○ "}${esc(s)} <span class="muted small">${SKILLS[s]}</span></span><span>${sgn(pcSkillBonus(p, s))}</span></div>`).join("")}
+    <div class="kv" style="margin-top:.3rem"><span>Passive Perception</span><b>${10 + pcSkillBonus(p, "Perception")}</b></div></details>
   <div class="sec"><h3>Conditions</h3>${p.conditions.length ? `<div class="chips">${p.conditions.map(c => `<button class="chip" data-act="rmcond" data-c="${esc(c)}" title="Remove">${esc(c)} ✕</button>`).join("")}</div>` : `<span class="small muted">None</span>`}</div>
-  <div class="sec" data-k="inv"><h3>Inventory <span class="small muted" data-k="gold">— ${p.gold} gp</span></h3>
+  <div class="sec" data-k="inv" id="sec-inv"><h3>Inventory <span class="small muted" data-k="gold">— ${p.gold} gp</span></h3>
     <ul class="list">${p.inventory.map((it, i) => `<li>${esc(it)} <button class="btn sm ghost" data-act="rmitem" data-i="${i}" aria-label="Remove ${esc(it)}" style="padding:0 .35em">✕</button></li>`).join("")}</ul>
     <div class="row" style="margin-top:.4rem"><input type="text" id="newItem" placeholder="Add item" style="flex:1"><button class="btn sm" data-act="additem">Add</button></div>
     <div class="row" style="margin-top:.4rem"><span class="small">Gold</span><input type="number" id="goldIn" value="${p.gold}" style="width:6em"><button class="btn sm" data-act="setgold">Set</button></div></div>
-  <div class="sec" data-k="features"><h3>Features &amp; spells</h3><textarea id="featIn" rows="9">${esc(p.features)}</textarea></div>
-  <div class="sec"><h3>Chronicle</h3><ul class="chron">${p.chronicle.slice().reverse().slice(0, 12).map(c => `<li>${esc(c.t)}</li>`).join("")}</ul></div>
-  <div class="sec"><h3>Backstory</h3><textarea id="storyIn" rows="5">${esc(p.backstory)}</textarea></div>
+  <details class="sec" data-k="features" data-sec="feat" id="sec-feat" ${openAttr("feat", true)}><summary><h3>Features &amp; spells</h3></summary><textarea id="featIn" rows="9">${esc(p.features)}</textarea></details>
+  <details class="sec" data-sec="chron" id="sec-chron" ${openAttr("chron", !narrow)}><summary><h3>Chronicle</h3></summary><ul class="chron">${p.chronicle.slice().reverse().slice(0, 12).map(c => `<li>${esc(c.t)}</li>`).join("")}</ul></details>
+  <details class="sec" data-sec="story" ${openAttr("story", false)}><summary><h3>Backstory</h3></summary><textarea id="storyIn" rows="5">${esc(p.backstory)}</textarea></details>
   <div class="sec row"><button class="btn sm" data-act="shortrest" ${busy ? "disabled" : ""}>Short rest</button><button class="btn sm" data-act="longrest" ${busy ? "disabled" : ""}>Long rest</button>
     ${haveImageAI() ? `<button class="btn sm ghost" data-act="pcportrait">${p.portraitId ? "New portrait" : "Paint portrait"}</button>` : ""}
     <button class="btn sm ghost" data-act="pdf">Download PDF</button></div>`;
   hydrateImages(S);
+  $$("details[data-sec]", S).forEach(d => d.addEventListener("toggle", () => { sheetOpen[d.dataset.sec] = d.open; }));
   sheetFlash.forEach(k => $$(`[data-k="${k}"]`, S).forEach(el => el.classList.add("flash")));
   sheetFlash.clear();
   $("#featIn").onchange = e => { p.features = e.target.value; saveGame(game); };
@@ -2851,12 +3061,14 @@ function openGallery() {
 
 /* ============ actions (event delegation) ============ */
 const act = {
-  close: closeModal, settings: openSettings, home: () => { if (game) saveGame(game); renderHome(); },
-  new: () => { mapState.full = false; if (!haveTextAI()) { toast("Add an API key in Settings first."); openSettings(); return; } newDraft(); renderCreator(); },
+  close: closeModal, settings: openSettings, home: () => { if (game) saveGame(game, { noSync: true }); renderHome(); syncNow(); },
+  new: () => { mapState.full = false; mapState.open = true; if (!haveTextAI()) { toast("Add an API key in Settings first."); openSettings(); return; } newDraft(); renderCreator(); },
   load: async el => {
     mapState.full = false; mapState.tokens.clear(); mapState.parts = []; const g = await loadGame(el.dataset.id);
     if (!g) { toast("That save couldn't be read."); return; }
-    game = g; ensureMemory(g); undoSnap = null; busy = false; renderPlay();
+    game = g; ensureMemory(g); undoSnap = null; busy = false;
+    mapState.open = window.innerWidth > 1000 || !!g.combat;
+    renderPlay();
     const dmTurns = g.log.filter(e => e.role === "dm").length;
     if (!dmTurns) { takeTurn(null); return; }
     if (Date.now() - (g.updated || 0) > 20 * 60 * 1000 && haveTextAI()) showRecap(g);
@@ -2892,7 +3104,10 @@ JSON: {"companions":[{"name":"","species":"","cls":"","role":"short role e.g. He
     renderCreator(); }),
   begin: el => withBtn(el, beginAdventure),
   // play
-  tab: el => { playTab = el.dataset.t; const P = $("#play"); P.dataset.tab = playTab; $$(".tabbar button").forEach(b => b.classList.toggle("on", b.dataset.t === playTab)); if (playTab === "story") scrollDown(true); },
+  tab: el => { playTab = el.dataset.t; const P = $("#play"); P.dataset.tab = playTab; $$(".tabbar button").forEach(b => b.classList.toggle("on", b.dataset.t === playTab)); if (playTab === "story") updateJump(); },
+  jump: () => { const S = $("#scroll"); S.scrollTo({ top: S.scrollHeight, behavior: reducedMotion() ? "auto" : "smooth" }); },
+  more: () => { logShown += 50; renderLog("keep"); },
+  sheetgo: el => { const t = document.getElementById(el.dataset.t); if (!t) return; if (t.tagName === "DETAILS") t.open = true; t.scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth", block: "start" }); },
   send: sendSay,
   sugg: el => { if (!busy) takeTurn(el.textContent.trim()); },
   proll: el => doPendingRoll(el.dataset.id),
@@ -2931,7 +3146,7 @@ JSON: {"companions":[{"name":"","species":"","cls":"","role":"short role e.g. He
   memRebuild: el => withBtn(el, async () => { await maybeSummarize(true); const n = await buildCodexFromStory(game); toast(n ? `Found ${n} things to remember.` : "Nothing new to remember."); openCodex(); renderPlayAll(); }),
   addQuest: () => { const v = $("#newQuest").value.trim(); if (!v) return; applyQuests(game, [{ name: v, status: "active", note: "Set by you" }]); game.log.push({ id: uid(), role: "system", forAI: true, text: `The player set a personal goal: ${v}` }); saveGame(game); openCodex("quests"); renderRight(); },
   addNote: () => { const v = $("#newNote").value.trim(); if (!v) return; addPlayerNotes([v]); openCodex("you"); },
-  rmNote: el => { const t = tableMem(); t.notes = t.notes.filter(n => n.id !== el.dataset.id); saveTableMem(t); openCodex("you"); },
+  rmNote: el => { const t = tableMem(); t.forgotten = [...(t.forgotten || []), el.dataset.id]; t.notes = t.notes.filter(n => n.id !== el.dataset.id); saveTableMem(t); openCodex("you"); },
   newEntry: () => { const type = codexTab === "lore" ? "lore" : codexTab; const ch = rememberEntries(game, [{ type, name: "New " + (type === "npc" ? "person" : type), summary: "" }]); saveGame(game); if (ch[0]) openEntry(ch[0].e.id); },
   delEntry: el => { if (!confirm("Forget this for good? The DM won't remember it either.")) return; const e = game.codex.find(x => x.id === el.dataset.id); game.codex = game.codex.filter(x => x.id !== el.dataset.id); saveGame(game); renderLog(); openCodex(e && ["item", "lore", "event"].includes(e.type) ? "lore" : e?.type); },
   paintEntry: el => withBtn(el, async () => {
@@ -2967,7 +3182,7 @@ $("#homeBtn").onclick = () => act.home();
 $("#settingsBtn").onclick = openSettings;
 if ("speechSynthesis" in window) speechSynthesis.onvoiceschanged = () => {};
 window.addEventListener("beforeunload", () => { if (game) saveGame(game); });
-migrateSaves().finally(renderHome);
+migrateSaves().finally(() => { renderHome(); if (syncOn()) syncNow(); });
 </script>
 </body>
 </html>
