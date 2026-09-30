@@ -1349,6 +1349,10 @@ function openSettings() {
   <label class="check"><input type="checkbox" id="s_img" ${settings.images ? "checked" : ""}> Create images (portraits, scenes, region maps)</label>
   <label class="f"><span>Who paints them</span>
     <select id="s_ip"><option value="auto">OpenAI if I've added an OpenAI key, otherwise the free painter</option><option value="openai">OpenAI only</option><option value="free">Free painter only (Pollinations, no key needed)</option></select></label>
+  <div id="oimgBox" class="${settings.imageProvider === "free" ? "hidden" : ""}">
+    <label class="f"><span>OpenAI API key for images (the same key GPT uses) <a class="keylink" href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">get one</a></span>
+      <input type="password" id="s_oimg" placeholder="sk-… (leave empty to use the free painter)" value="${esc(settings.openaiKey)}" autocomplete="off"></label>
+  </div>
   <div class="grid2">
     <label class="f"><span>OpenAI image model</span><input type="text" id="s_im" list="imgModels" value="${esc(settings.imageModel)}">
       <datalist id="imgModels"><option value="gpt-image-1"><option value="gpt-image-1-mini"><option value="dall-e-3"></datalist></label>
@@ -1369,6 +1373,10 @@ function openSettings() {
     <span class="spacer"></span><button class="btn ghost" data-act="close">Cancel</button><button class="btn primary" id="s_save">Save settings</button>
   </div>`);
   $("#s_provider").value = settings.provider; $("#s_iq").value = settings.imageQuality; $("#s_ip").value = settings.imageProvider;
+  // The OpenAI key box appears in two places (GPT storyteller and images); keep them in step.
+  const ko = $("#k_openai"), ki = $("#s_oimg");
+  ko.oninput = () => { ki.value = ko.value; }; ki.oninput = () => { ko.value = ki.value; };
+  $("#s_ip").onchange = e => $("#oimgBox").classList.toggle("hidden", e.target.value === "free");
   $("#s_provider").onchange = e => $$(".pblock").forEach(b => b.classList.toggle("hidden", b.dataset.p !== e.target.value));
   if ($("#sy_in")) $("#sy_in").onclick = async () => { const b = $("#sy_in"); b.disabled = true; setSyncStatus("Signing in…");
     try { await connectSync($("#sy_tok").value); openSettings(); } catch (e) { setSyncStatus("Sign-in didn't work: " + e.message, true); b.disabled = false; } };
